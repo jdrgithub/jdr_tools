@@ -65,26 +65,26 @@ result = model.transcribe(audio_path, fp16=False)
 controls how sensitive the model is to detecting actual speech vs silence or noise. 
 It's used to help skip segments that contain no meaningful speech.
 
-🔍 no_speech_threshold — What It Means
+no_speech_threshold — What It Means
 It works together with Whisper’s voice activity detection (VAD).
 Each segment has an associated no_speech_prob — the model’s internal guess of whether there's no speech.
 If no_speech_prob > no_speech_threshold, that segment will be skipped (treated as silence).
 You control that cutoff with no_speech_threshold.
 
-📊 Practical Values
+Practical Values
 Threshold	Behavior
 0.0	Never skip — transcribe everything, even silence or static
 0.3	Default — reasonably permissive (often keeps quiet segments with low confidence)
 0.6	Stricter — skip anything unless the model is confident there's speech
 0.9	Very strict — great if there's lots of background noise or music
 
-🧠 Why You Might Use no_speech_threshold=0.6
+Why You Might Use no_speech_threshold=0.6
 You’re seeing repetition, filler words, or hallucinated speech like "Okay okay okay"
 This often happens when the model thinks there’s speech but isn’t sure.
 Increasing this threshold helps ignore low-confidence, non-speech segments.
 Especially useful in interviews where there are long pauses, coughs, typing, etc.
 
-✅ Example Usage
+Example Usage
 In your Python script:
 
 result = model.transcribe(
