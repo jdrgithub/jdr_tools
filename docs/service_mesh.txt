@@ -1,0 +1,433 @@
+
+
+Kiali is the observability and management console for Istio service mesh.
+
+At its core, it provides three things:
+
+Visualization – It builds a real-time graph of services, workloads, and traffic inside the mesh. You can see who is talking to whom, how much traffic is flowing, what protocols are used, and whether errors are happening.
+
+Configuration insight – It shows Istio configuration objects like Gateways, VirtualServices, DestinationRules, etc., and highlights problems such as misapplied selectors, missing labels, or conflicting routing rules. It helps catch mistakes that might not be obvious from YAML alone.
+
+Health and tracing integration – It pulls in metrics from Prometheus (for traffic, latency, error rates) and can link to Jaeger/Tempo for distributed traces. This lets you drill down from a high-level graph into request-level detail.
+In OpenShift Service Mesh, Kiali is deployed alongside Istio and Jaeger as part of the “observability stack.” It becomes the web dashboard you open when you want to see your mesh in action, instead of just reading YAML or using istioctl.
+Would you like me to also explain how Kiali actually discovers traffic (e.g., what data sources it uses), or keep it at the functional level for now?
+
+A PodMonitor is a Prometheus Operator custom resource (CRD). Its job is to tell Prometheus how to scrape metrics from pods that expose metrics endpoints.
+
+Prometheus on its own doesn’t magically know which pods to scrape.
+
+A PodMonitor defines label selectors and a port/path so Prometheus Operator can automatically generate the right scrape configs.
+This way, whenever new pods matching the labels are created, Prometheus automatically discovers and scrapes them.
+How it relates to Istio/Kiali
+Kiali doesn’t scrape metrics itself; it queries Prometheus for traffic data, error rates, latency, etc.
+If Prometheus isn’t scraping your mesh workloads (via PodMonitors or ServiceMonitors), Kiali won’t have the metrics it needs to draw the service graph or display health.
+For Istio specifically, PodMonitors are often used to make sure Envoy sidecar proxies (the Istio data plane) and Istio system components (like Pilot, Mixer, etc. in older versions) are scraped. Those proxies export the mesh metrics that Kiali depends on.
+Why “necessary”
+Without PodMonitors (or ServiceMonitors), Prometheus would only scrape what it was manually configured to, leaving gaps.
+If the proxies or workloads aren’t scraped, Kiali’s graph might look incomplete, missing traffic, or show “unknown” health.
+So: PodMonitor = Prometheus scrape config for pods → Prometheus collects mesh metrics → Kiali reads from Prometheus → you see traffic/health in the dashboard.
+
+
+1. How “vanilla” Prometheus scrapes
+Prometheus by itself uses static scrape configs (you define exact targets in prometheus.yml).
+It also has service discovery integrations (like Kubernetes), so it can discover pods and services.
+But discovery ≠ scraping. Discovery just gives Prometheus a list of possible endpoints (all pod IPs, service ClusterIPs, etc.).
+To actually scrape them, Prometheus needs rules telling it which ones, which port, and which path.
+So if you don’t configure that, Prometheus sees lots of pods but doesn’t know which should be scraped for metrics.
+
+2. Where PodMonitor/ServiceMonitor come in
+In clusters with the Prometheus Operator (like OpenShift) prometheus.yml isn't edited directly. Instead, you create a PodMonitor or ServiceMonitor CR.
+The Operator watches those CRs and dynamically updates Prometheus with the right scrape jobs.
+This way, you can say:
+“Scrape all pods in namespace X with label app=bookinfo, on port 15090, path /stats/prometheus.”
+Without that CR, Prometheus doesn’t know what to scrape, even if it discovered the pods exist.
+
+3. Why Istio needs this
+Istio’s Envoy sidecars emit metrics on a special port (15090) and path.
+
+Prometheus doesn’t just scrape every port on every pod.  That would be wasteful and error-prone.
+
+It must be told which ports/paths to scrape. That’s exactly what PodMonitors do.
+Once Prometheus is scraping those sidecars, Kiali can query Prometheus and show request rates, latencies, error percentages, etc.
+
+Prometheus does not scrape all pods by default..it discovers them, but need PodMonitor/ServiceMonitor to tell it what metrics endpoints matter.
+Yes, without PodMonitors/ServiceMonitors, Prometheus will miss Istio sidecar metrics. That means Kiali’s graphs would be empty or incomplete.
+
+# IN EFFECT
+Kubernetes API: “Here are all the pods and services in the cluster.”
+PodMonitor/ServiceMonitor: “Out of all those, here’s where the Prometheus metrics endpoints actually live.”
+Prometheus: “Okay, now I know where to scrape.”
+Kiali: “Great, now I can read those metrics and draw a service graph.”
+
+
+
+# =====================================================================
+# A) Policy check (what’s required)
+# =====================================================================
+
+$ns = "<your-bookinfo-namespace>"
+
+# PeerAuthentication in app namespace (STRICT means required)
+oc -n $ns get peerauthentication -o yaml
+
+# Mesh/control-plane defaults that might apply mesh-wide
+oc -n istio-system get peerauthentication -o yaml
+
+# Read:
+# - If any PeerAuthentication says spec.mtls.mode: STRICT, inbound requires mTLS.
+# - If PERMISSIVE or none, mTLS is not enforced (but auto-mTLS may still negotiate TLS).
+
+
+# =====================================================================
+# B) Runtime check (what’s actually happening on the wire)
+# =====================================================================
+
+# Use server-side Envoy stats: if clients are using mTLS,
+# the server proxy will show TLS handshakes.
+
+# Pick one backend (e.g., details) and get its pod
+$detailsPod = (oc -n $ns get pod -l app=details -o name) -replace '^pod/',''
+
+# Refresh /productpage in browser a few times to generate traffic,
+# then look for TLS indicators on the details proxy:
+oc -n $ns exec $detailsPod -c istio-proxy -- pilot-agent request GET /stats | `
+  Select-String 'downstream_cx_tls|ssl.handshake'
+
+# Interpretation:
+# - Non-zero values that increment when refreshing ⇒ mTLS is in use.
+# - Zero values while requests flow ⇒ plaintext to that service.
+# (Repeat with reviews or ratings pod to double-check.)
+
+
+# =====================================================================
+# C) Optional: client view (if istioctl works on the box)
+# =====================================================================
+
+$pp = (oc -n $ns get pod -l app=productpage -o name) -replace '^pod/',''
+
+# Look at outbound clusters to details/reviews/ratings
+istioctl proxy-config clusters $pp -n $ns | `
+  Select-String 'outbound.*(details|reviews|ratings).*9080'
+
+# Interpretation:
+# - TLS column populated ⇒ mTLS in use.
+# - TLS column blank ⇒ plaintext.
+
+
+# =====================================================================
+# Phase 1 — Apply DestinationRules (subsets)
+# =====================================================================
+
+# Create DestinationRules with ISTIO_MUTUAL (all subsets v1/v2/v3)
+oc -n $ns apply -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/bookinfo/networking/destination-rule-all-mtls.yaml
+
+# Verify
+oc -n $ns get destinationrule
+oc -n $ns get destinationrule reviews -o yaml | Select-String 'subsets:|name: v'
+
+# If TLS/mTLS errors appear, fallback to non-mTLS
+oc -n $ns delete -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/bookinfo/networking/destination-rule-all-mtls.yaml
+oc -n $ns apply  -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/bookinfo/networking/destination-rule-all.yaml
+
+
+# =====================================================================
+# Istio version verification (to pick correct sample branch)
+# =====================================================================
+
+# 1) Control-plane version (istiod image tag)
+oc -n istio-system get deploy istiod -o jsonpath='{.spec.template.spec.containers[0].image}{"`n"}'
+# docker.io/istio/pilot:1.20.2 ⇒ use release-1.20
+# docker.io/istio/pilot:1.19.9 ⇒ use release-1.19
+
+# 2) Sidecar (proxy) version on productpage
+$pp = (oc -n $ns get pod -l app=productpage -o name) -replace '^pod/',''
+oc -n $ns get pod $pp -o jsonpath='{.spec.containers[?(@.name=="istio-proxy")].image}{"`n"}'
+
+# 3) Bookinfo app image tags (sanity check)
+oc -n $ns get deploy -l 'app in (productpage,details,reviews,ratings)' `
+  -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.template.spec.containers[0].image}{"`n"}{end}'
+
+# 4) Optional istioctl check
+istioctl version
+
+
+# =====================================================================
+# Phase 1 — Verify current state (before applying)
+# =====================================================================
+
+# 1) DestinationRules present?
+oc -n $ns get destinationrule
+oc -n istio-system get destinationrule
+oc get destinationrule -A
+# “No resources found” ⇒ none created yet.
+
+# 2) Which VirtualServices exist?
+oc -n $ns get virtualservice
+# Likely only the bookinfo VS (gateway → productpage).
+
+# 3) Is mTLS enforced by policy?
+oc -n $ns get peerauthentication -o yaml
+oc -n istio-system get peerauthentication -o yaml
+
+# 4) Is mTLS in use (runtime check)?
+$detailsPod = (oc -n $ns get pod -l app=details -o name) -replace '^pod/',''
+oc -n $ns exec $detailsPod -c istio-proxy -- pilot-agent request GET /stats | `
+  Select-String 'downstream_cx_tls|ssl.handshake'
+
+
+# =====================================================================
+# Deciding which DRs to apply
+# =====================================================================
+
+# No DRs found ⇒ safe to create.
+# If mTLS STRICT enforced or in use ⇒ apply destination-rule-all-mtls.yaml
+# If not enforced and not in use ⇒ apply destination-rule-all.yaml (non-mTLS)
+
+
+# =====================================================================
+# istioctl mTLS confirmation (two shortest ways, PowerShell 5.1)
+# =====================================================================
+
+# 0) Get productpage pod
+$pod = (oc -n $ns get pod -l app=productpage -o name) -replace '^pod/',''
+
+# Option A — Look at outbound clusters
+istioctl proxy-config clusters $pod -n $ns --fqdn details.$ns.svc.cluster.local --port 9080 --direction outbound
+istioctl proxy-config clusters $pod -n $ns --fqdn reviews.$ns.svc.cluster.local --port 9080 --direction outbound
+istioctl proxy-config clusters $pod -n $ns --fqdn ratings.$ns.svc.cluster.local --port 9080 --direction outbound
+
+# Filter shortcut
+istioctl proxy-config clusters $pod -n $ns | `
+  Select-String 'outbound.*(details|reviews|ratings).*9080'
+
+# Option B — One-shot mTLS check (if supported)
+istioctl authn tls-check $pod -n $ns
+istioctl authn tls-check $pod -n $ns details.$ns.svc.cluster.local
+
+
+# =====================================================================
+# Apply non-mTLS DestinationRules (if that matches current policy)
+# =====================================================================
+
+oc -n $ns apply -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/bookinfo/networking/destination-rule-all.yaml
+
+# Verify DestinationRules and subsets
+oc -n $ns get destinationrule
+oc -n $ns get destinationrule reviews -o yaml | Select-String 'subsets:|name: v'
+
+# If later STRICT mTLS is enforced, replace them with:
+oc -n $ns delete -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/bookinfo/networking/destination-rule-all.yaml
+oc -n $ns apply  -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/bookinfo/networking/destination-rule-all-mtls.yaml
+
+
+# =====================================================================
+# Sanity check that the cluster supports these Istio resources
+# =====================================================================
+
+oc api-resources | findstr /I "destinationrules virtualservices"
+oc explain destinationrule
+oc explain virtualservice
+
+# Expect to see networking.istio.io resources listed.
+# Then proceed with Istio 1.20 samples in app namespace:
+oc -n $ns apply -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/bookinfo/networking/destination-rule-all.yaml
+oc -n $ns apply -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/bookinfo/networking/virtual-service-all-v1.yaml
+
+# If STRICT mTLS is enabled later, replace with destination-rule-all-mtls.yaml
+
+
+
+# TROUBLESHOOTING INTER NS AND SERVICE TRAFFIC
+# =====================================================================
+# 1) Generate in-cluster traffic to prove productpage is serving
+# =====================================================================
+
+# Run a throwaway curl pod in the SAME namespace
+oc -n <ns> run kcurl --image=curlimages/curl:8.10.1 --restart=Never -it --rm -- \
+  sh -lc 'for i in $(seq 1 100); do curl -fsS http://productpage:9080/productpage >/dev/null || echo FAIL; sleep 0.2; done'
+
+
+# =====================================================================
+# 2) Watch the envoy (sidecar) access logs on productpage (not the app container)
+# =====================================================================
+
+oc -n <ns> logs deploy/productpage -c istio-proxy --tail=0 -f
+
+# Interpretation:
+# - If GET /productpage entries appear but no edges to details/reviews/ratings,
+#   the app isn’t calling them (or envoy is blocked from egress).
+
+
+# =====================================================================
+# 3) From the proxy, verify it knows about the other services
+# =====================================================================
+
+# If istioctl is available locally:
+
+# Do clusters exist for details/reviews/ratings?
+istioctl proxy-config clusters deploy/productpage -n <ns> | egrep 'outbound.*(details|reviews|ratings).*9080'
+
+# Do those clusters have endpoints?
+istioctl proxy-config endpoints deploy/productpage -n <ns> | egrep '(details|reviews|ratings).*READY'
+
+# Interpretation:
+# - Missing clusters/endpoints ⇒ Sidecar resource restricting egress, or selectors/ports incorrect.
+
+
+# =====================================================================
+# 4) Check for a Sidecar resource restricting egress
+# =====================================================================
+
+oc get sidecar -A
+
+# Interpretation:
+# - If one selects the namespace and doesn’t include egress.hosts:
+#   ["*/details.*","*/reviews.*","*/ratings.*"] (or "./*"),
+#   productpage → others will be blocked.
+# - Fix or remove, then repeat Step 1.
+
+
+# =====================================================================
+# 5) Confirm actual outbound attempts from envoy
+# =====================================================================
+
+# Look for upstream request counters from the proxy
+oc -n <ns> exec deploy/productpage -c istio-proxy -- \
+  pilot-agent request GET /stats | egrep 'upstream_rq_.*(details|reviews|ratings)|upstream_cx_connect_fail'
+
+# Interpretation:
+# - Zero upstream_rq_... to those services ⇒ app isn’t calling them.
+# - Non-zero connect_fail/timeout ⇒ network policy / mTLS / routing issue.
+
+
+# =====================================================================
+# 6) Sanity: hit the backends directly (bypass productpage)
+# =====================================================================
+
+# From the same kcurl pod (or re-run if deleted)
+for s in details reviews ratings; do
+  echo "== $s =="; curl -sS http://$s:9080/health || echo FAIL
+done
+
+# Interpretation:
+# - Failures here ⇒ networking/policy issue.
+# - Success here but Step 5 shows no outbound from productpage ⇒
+#   productpage app image/config not making those calls.
+
+
+# =====================================================================
+# Expected outcome
+# =====================================================================
+# Envoy on productpage shows inbound /productpage but no outbound to
+# details/reviews/ratings ⇒ either a restrictive Sidecar resource,
+# or a non-standard productpage image that doesn’t call those services.
+
+
+
+# thanos-querier ports:
+# 9091 = HTTPS "web" API (what Kiali uses). Use this for PromQL queries.
+# 9092 = tenancy-enforced web API (multi-tenancy headers/filters). Not needed here.
+# 10901 = gRPC StoreAPI (not for curl/HTTP).
+
+# Use 9091. One-and-done test:
+
+# port-forward thanos-querier web port
+oc -n openshift-monitoring port-forward svc/thanos-querier 9091:9091
+
+# get a token for the Kiali SA (or any SA with cluster-monitoring-view)
+TOKEN=$(oc -n istio-system create token kiali)
+
+# run a simple PromQL over HTTPS
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  'https://127.0.0.1:9091/api/v1/query?query=sum(rate(istio_requests_total[1m]))'
+
+# If that returns data, Kiali’s backend is reachable.
+
+# If you want to see /targets, that’s on Prometheus, not Thanos. Forward the user-workload Prometheus if it exists:
+oc -n openshift-user-workload-monitoring get svc prometheus-user-workload
+oc -n openshift-user-workload-monitoring port-forward svc/prometheus-user-workload 9090:9090
+curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active'
+
+
+#### UWM USER WORKLOAD MANAGEMENT 
+
+# Step 1 — Do you actually have the UWM Prometheus?
+oc -n openshift-user-workload-monitoring get statefulset,pod -o wide
+
+# What you should see if UWM is on:
+# StatefulSets: prometheus-user-workload, thanos-ruler-user-workload
+# Pods named like: prometheus-user-workload-0 (and possibly -1)
+
+# If you see them, port-forward Prometheus and check targets:
+
+# port-forward the Prometheus *service*
+oc -n openshift-user-workload-monitoring get svc | grep prometheus-user-workload
+oc -n openshift-user-workload-monitoring port-forward svc/prometheus-user-workload 9090:9090
+
+# targets should include your namespace after your PodMonitor fix
+curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active' \
+| jq -r '.data.activeTargets[] | select(.labels.namespace=="<your-ns>") | "\(.labels.job) -> \(.labels.pod) [\(.health)]"'
+
+# If you do not see those StatefulSets, UWM isn’t fully enabled yet. Enable it (cluster-admin only), then wait a couple minutes for the operator to spin them up:
+
+# check current setting
+oc -n openshift-monitoring get cm cluster-monitoring-config -o yaml | sed -n '1,120p'
+
+# enable UWM if missing/false
+oc -n openshift-monitoring create cm cluster-monitoring-config \
+  --from-literal=config.yaml=$'enableUserWorkload: true' \
+  --dry-run=client -o yaml | oc apply -f -
+
+# watch for the namespace & StatefulSets to appear
+oc get ns openshift-user-workload-monitoring || true
+oc -n openshift-user-workload-monitoring get statefulset
+
+# Once Prometheus is up and your PodMonitor (with namespaceSelector.matchNames: ["<your-ns>"]
+# and label release: prometheus-user-workload) is applied, you’ll see your sidecars as UP in /targets,
+# and Kiali (which points at Thanos) will start showing traffic as you generate in-mesh requests.
+
+
+# Confirm Prom sees targets in your namespace (should flip to UP ~30–90s after your edit):
+
+# 1) Port-forward the UWM Prometheus
+# NOTE: In many clusters this Prometheus runs as a StatefulSet/service named prometheus-user-workload.
+# The original command below used a Deployment; if that fails, port-forward the Service instead:
+#   oc -n openshift-user-workload-monitoring port-forward svc/prometheus-user-workload 9090:9090
+oc -n openshift-user-workload-monitoring port-forward deploy/prometheus-user-workload 9090:9090 >/dev/null 2>&1 &
+
+# 2) List active targets for your namespace
+curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active' \
+| jq -r '.data.activeTargets[]
+         | select(.labels.namespace=="<your-ns>")
+         | "\(.labels.job)  ->  \(.labels.pod)  [\(.health)]"'
+
+# If you see lines for your pods with [up], you’re good—Kiali (via Thanos) will have data as soon as you generate in-mesh traffic.
+# If it’s empty, show me that output and we’ll tighten the selector/labels next.
+
+
+# Use two different port-forwards, depending on what you’re checking:
+
+# A) Verify your PodMonitor created scrape targets (User-Workload Prometheus)
+# forward the user-workload Prometheus (this shows /targets)
+oc -n openshift-user-workload-monitoring port-forward deploy/prometheus-user-workload 9090:9090
+
+# Now check your namespace targets:
+curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active' \
+| jq -r '.data.activeTargets[]
+         | select(.labels.namespace=="<your-ns>")
+         | "\(.labels.job)  ->  \(.labels.pod)  [\(.health)]"'
+
+# B) Mimic what Kiali queries (Thanos Querier)
+# use 9091→9091 so you don’t confuse ports
+oc -n openshift-monitoring port-forward svc/thanos-querier 9091:9091
+# get a token from the Kiali SA
+SA=$(oc -n istio-system get sa | awk '/^kiali($|-)/{print $1; exit}')
+TOKEN=$(oc -n istio-system create token "$SA")
+# run a quick Istio query
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  'https://127.0.0.1:9091/api/v1/query?query=sum(rate(istio_requests_total[1m]))'
+  
+  
+  
+  
+

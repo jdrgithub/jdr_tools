@@ -1,0 +1,156 @@
+
+
+# =========================
+# istioctl CHEAT SHEET
+# =========================
+# Adjust these once per session:
+export NS=mesh-demo                     # your app namespace
+export POD=$(kubectl -n $NS get pod -l app=productpage -o jsonpath='{.items[0].metadata.name}')
+export GW_NS=istio-system               # control-plane namespace (often istio-system)
+
+# -------------------------
+# 0) Install / Upgrade / Profiles
+# -------------------------
+# Dry-run an install (see what would change)
+istioctl install --set profile=demo --dry-run
+
+# Install with a specific profile (demo|default|minimal|external)
+istioctl install --set profile=default -y
+
+# List & inspect profiles to know what each installs
+istioctl profile list
+istioctl profile dump default
+
+# Upgrade control plane to the version of this istioctl binary
+istioctl upgrade -y
+
+# Quick preflight / env checks (before install/upgrade)
+istioctl x precheck
+
+# -------------------------
+# 1) Validate Config (before you break traffic)
+# -------------------------
+# Validate YAML files locally
+istioctl validate -f gateway.yaml -f virtualservice.yaml
+
+# Analyze live cluster state (and files together) for conflicts/mistakes
+istioctl analyze
+istioctl analyze -n $NS -f ./istio-manifests/
+
+# -------------------------
+# 2) What’s Deployed & Healthy?
+# -------------------------
+# Versions (CLI ↔ control plane ↔ sidecars)
+istioctl version
+
+# High-level health view of all sidecars connected to the mesh
+istioctl proxy-status
+
+# Explain what applies to a pod: VS/DR/mTLS/policies/peer-auth, etc.
+istioctl describe pod $POD -n $NS
+
+# -------------------------
+# 3) Deep-Dive: Envoy (per-pod)
+# -------------------------
+# Show Envoy routes / clusters / listeners / endpoints on a specific pod
+istioctl proxy-config routes     $POD -n $NS
+istioctl proxy-config clusters   $POD -n $NS
+istioctl proxy-config listeners  $POD -n $NS
+istioctl proxy-config endpoints  $POD -n $NS
+istioctl proxy-config bootstrap  $POD -n $NS
+istioctl proxy-config secret     $POD -n $NS
+
+# Filter examples (handy when output is huge)
+istioctl proxy-config routes $POD -n $NS --name http.8080
+istioctl proxy-config clusters $POD -n $NS --fqdn productpage.$NS.svc.cluster.local
+
+# Compare what’s in the xDS cache vs. what you expect
+istioctl proxy-config listeners $POD -n $NS --port 15001
+
+# Turn on/off Envoy debug for a pod (temporary troubleshooting)
+istioctl pc log $POD -n $NS --level debug
+istioctl pc log $POD -n $NS --level warning
+
+# -------------------------
+# 4) Traffic, Gateways, and Ingress Sanity
+# -------------------------
+# See which Gateway(s)/VirtualService(s) affect routes to a given host
+istioctl analyze -n $NS --use-kube
+
+# Describe a Service to see mesh objects in-path (good for “why 404?”)
+istioctl describe svc productpage -n $NS
+
+# -------------------------
+# 5) Security: mTLS & Authorization
+# -------------------------
+# Check mTLS mode between source and destination
+# (sourcePod can be omitted; single-pod check shows peer-authn policy)
+istioctl authn tls-check $POD -n $NS
+
+# Quick read on PeerAuthentication / DestinationRule in effect
+istioctl describe pod $POD -n $NS | sed -n '/PeerAuthentication/,$p'
+
+# AuthorizationPolicy evaluation: "would this request be allowed?"
+# Format: istioctl x authz check <pod> --name <policyName> --method <HTTP> --path <PATH> --port <PORT>
+istioctl x authz check $POD -n $NS --method GET --path /productpage --port 9080
+
+# -------------------------
+# 6) Rollouts / Sidecar Sync
+# -------------------------
+# Force pods to pick up fresh config (no spec changes required)
+kubectl -n $NS rollout restart deploy/productpage
+
+# See if a pod’s sidecar is out-of-sync with Istiod
+istioctl proxy-status | grep $POD || true
+
+# -------------------------
+# 7) Common “What’s Wrong?” Workups
+# -------------------------
+# A) Route not matching? Check VirtualService host and gateway bindings:
+istioctl validate -f virtualservice.yaml
+istioctl proxy-config routes $POD -n $NS | less
+
+# B) Cluster not found / 503? Confirm DR subsets and endpoints:
+istioctl proxy-config clusters $POD -n $NS | grep productpage || true
+istioctl proxy-config endpoints $POD -n $NS | grep productpage || true
+
+# C) mTLS handshake issues? Confirm policy & DR tls modes agree:
+istioctl authn tls-check $POD -n $NS
+istioctl describe pod $POD -n $NS | sed -n '/DestinationRule/,$p'
+
+# D) Sidecar never connects? Check control-plane reachability and SDS:
+istioctl proxy-status | head
+kubectl -n $NS logs $POD -c istio-proxy --tail=200
+
+# -------------------------
+# 8) Dashboards (quick launches)
+# -------------------------
+# Open local tunnels to common dashboards (if installed)
+istioctl dashboard kiali
+istioctl dashboard grafana
+istioctl dashboard jaeger
+
+# -------------------------
+# 9) Uninstall (clean teardown)
+# -------------------------
+# Remove the control plane installed by istioctl
+istioctl uninstall -y --purge
+
+# -------------------------
+# 10) Handy Installs of istioctl (pick one)
+# -------------------------
+# Linux/macOS (download from Istio release, then add to PATH)
+# curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.23.0 sh -
+# export PATH="$PWD/istio-1.23.0/bin:$PATH"
+
+# macOS Homebrew
+# brew install istioctl
+
+# Windows (Scoop)
+# scoop bucket add istio https://github.com/istio/scoop-bucket
+# scoop install istioctl
+
+# Windows (Chocolatey)
+# choco install istioctl
+
+
